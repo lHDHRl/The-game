@@ -3,8 +3,8 @@ import Phaser from 'phaser';
 // --- Мир ---
 const PEDESTAL_WIDTH = 220;
 const PEDESTAL_HEIGHT = 120;
-/** Блок, упавший ниже верха пьедестала на столько пикселей, считается потерянным. */
-const FALL_LIMIT = 160;
+/** Блок, опустившийся на столько пикселей ниже места, где он стоял (или ниже вершины башни), считается потерянным. */
+const LOST_DROP = 140;
 
 // --- Блоки ---
 const BLOCK_START_WIDTH = 130;
@@ -24,6 +24,8 @@ const DYNAMIC_FLOORS = 6;
 const CRANE_GAP = 150;
 /** Какая доля скорости крана передаётся блоку при отпускании (1 = вся). */
 const CRANE_INERTIA = 0.5;
+/** Какая доля горизонтальной скорости остаётся у блока после первого касания: блок «цепляется» и не тащит башню вбок. */
+const LANDING_GRIP = 0.15;
 const CRANE_AMPLITUDE = 230;
 const CRANE_BASE_SPEED = 1.6; // рад/с
 const CRANE_SPEED_PER_FLOOR = 0.05;
@@ -56,6 +58,8 @@ type State = 'aiming' | 'falling' | 'over';
 interface Block {
   body: MatterJS.BodyType;
   view: Phaser.GameObjects.Rectangle;
+  /** Высота центра блока в момент, когда он встал на башню. */
+  landedY: number;
 }
 
 /**
@@ -70,9 +74,11 @@ export class GameScene extends Phaser.Scene {
   private falling: Block | null = null;
   private hook!: Phaser.GameObjects.Rectangle;
   private rope!: Phaser.GameObjects.Graphics;
-  private craneTime = 0;
+  /** Фаза качания крана. Копится по кадрам, чтобы смена скорости не дёргала кран. */
+  private cranePhase = 0;
   private settleTimer = 0;
   private fallTimer = 0;
+  private hasGripped = false;
   private overAt = 0;
   private score = 0;
   private best = 0;
@@ -91,7 +97,7 @@ export class GameScene extends Phaser.Scene {
     this.state = 'aiming';
     this.placed = [];
     this.falling = null;
-    this.craneTime = 0;
+    this.cranePhase = 0;
     this.score = 0;
     this.best = loadBest();
     this.towerX = width / 2;
@@ -117,7 +123,7 @@ export class GameScene extends Phaser.Scene {
     this.syncViews();
 
     if (this.state === 'aiming') {
-      this.craneTime += delta / 1000;
+      this.cranePhase += this.craneSpeed() * (delta / 1000);
       this.positionHook();
     } else if (this.state === 'falling') {
       this.checkFallingBlock(delta);
@@ -148,6 +154,7 @@ export class GameScene extends Phaser.Scene {
       restitution: 0,
       density: BLOCK_DENSITY,
       chamfer: { radius: BLOCK_CHAMFER },
+      onCollideCallback: () => this.gripOnFirstContact(body),
     });
     // Блок уносит с собой скорость крана: отпускать нужно с упреждением.
     // Скорость в Matter измеряется в пикселях за шаг (1/60 с).
@@ -156,15 +163,27 @@ export class GameScene extends Phaser.Scene {
     const view = this.add.rectangle(body.position.x, body.position.y, width, BLOCK_HEIGHT, this.hook.fillColor);
     view.setStrokeStyle(2, 0xffffff, 0.35);
 
-    this.falling = { body, view };
+    this.falling = { body, view, landedY: 0 };
     this.hook.setVisible(false);
     this.rope.clear();
     this.settleTimer = 0;
     this.fallTimer = 0;
+    this.hasGripped = false;
     this.state = 'falling';
   }
 
   // ---------- Падение и приземление ----------
+
+  /**
+   * При первом касании гасим большую часть горизонтальной скорости блока.
+   * Без этого блок с разгона тянет трением верхние этажи вбок, и даже
+   * идеально поставленная башня постепенно кренится и падает.
+   */
+  private gripOnFirstContact(body: MatterJS.BodyType): void {
+    if (this.falling?.body !== body || this.hasGripped) return;
+    this.hasGripped = true;
+    this.matter.body.setVelocity(body, { x: body.velocity.x * LANDING_GRIP, y: body.velocity.y });
+  }
 
   private checkFallingBlock(delta: number): void {
     if (!this.falling) return;
@@ -195,6 +214,7 @@ export class GameScene extends Phaser.Scene {
     const offset = previous ? Math.abs(block.body.position.x - previous.body.position.x) : Infinity;
     const isPerfect = offset <= PERFECT_TOLERANCE;
 
+    block.landedY = block.body.position.y;
     this.placed.push(block);
     this.falling = null;
     this.score += 1 + (isPerfect ? PERFECT_BONUS : 0);
@@ -222,13 +242,17 @@ export class GameScene extends Phaser.Scene {
   }
 
   private hasLostBlock(): boolean {
-    const limit = this.pedestalTop + FALL_LIMIT;
-    if (this.falling && this.falling.body.position.y > limit) return true;
-    return this.placed.some((block) => block.body.position.y > limit);
+    if (this.falling && this.falling.body.position.y > this.towerTop() + LOST_DROP) return true;
+    return this.placed.some((block) => this.isLost(block));
+  }
+
+  /** Поставленный блок потерян, если заметно опустился относительно места, где встал (свалился с башни). */
+  private isLost(block: Block): boolean {
+    return block.body.position.y > block.landedY + LOST_DROP;
   }
 
   private gameOver(): void {
-    const towerFell = this.placed.some((block) => block.body.position.y > this.pedestalTop + FALL_LIMIT);
+    const towerFell = this.placed.some((block) => this.isLost(block));
     this.state = 'over';
     this.overAt = this.time.now;
     this.hook.setVisible(false);
@@ -254,11 +278,11 @@ export class GameScene extends Phaser.Scene {
   /** Горизонтальная скорость крана в пикселях в секунду. */
   private craneVelocityX(): number {
     const speed = this.craneSpeed();
-    return Math.cos(this.craneTime * speed) * speed * CRANE_AMPLITUDE;
+    return Math.cos(this.cranePhase) * speed * CRANE_AMPLITUDE;
   }
 
   private positionHook(): void {
-    const x = this.towerX + Math.sin(this.craneTime * this.craneSpeed()) * CRANE_AMPLITUDE;
+    const x = this.towerX + Math.sin(this.cranePhase) * CRANE_AMPLITUDE;
     const y = this.towerTop() - CRANE_GAP;
     this.hook.setPosition(x, y);
 
